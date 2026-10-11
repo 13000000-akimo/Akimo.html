@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Акимо: Пролог</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0a0000;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+    font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+    color:#eee;touch-action:none;}
+  #game{display:block;width:100vw;height:100vh;touch-action:none;}
+  #ui{position:fixed;inset:0;pointer-events:none;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui"></div>
+<script type="module">
+'use strict';
+
+// ============================================================
+//  УТИЛИТЫ
+// ============================================================
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const dist2=(ax,ay,bx,by)=>{const dx=ax-bx,dy=ay-by;return dx*dx+dy*dy;};
+const rand=(a,b)=>a+Math.random()*(b-a);
+const lerp=(a,b,t)=>a+(b-a)*t;
+
+// ============================================================
+//  АУДИО
+// ============================================================
+class AudioManager {
+  constructor(){ this.ctx=null; this.master=null; this.enabled=true; }
+  init(){
+    if(this.ctx) return;
+    const AC=window.AudioContext||window.webkitAudioContext;
+    this.ctx=new AC();
+    this.master=this.ctx.createGain();
+    this.master.gain.value=0.3;
+    this.master.connect(this.ctx.destination);
+  }
+  resume(){ if(this.ctx&&this.ctx.state==='suspended') this.ctx.resume(); }
+  _env(node,t0,a,d,peak=0.5){
+    const g=this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001,t0);
+    g.gain.exponentialRampToValueAtTime(peak,t0+a);
+    g.gain.exponentialRampToValueAtTime(0.0001,t0+a+d);
+    node.connect(g); g.connect(this.master);
+    return g;
+  }
+  tone(f0,f1,dur,type,vol){
+    if(!this.ctx) return;
+    const t=this.ctx.currentTime;
+    const o=this.ctx.createOscillator();
+    o.type=type||'sine';
+    o.frequency.setValueAtTime(f0,t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+dur);
+    this._env(o,t,0.005,dur,vol||0.15);
+    o.start(t); o.stop(t+dur+0.05);
+  }
+  noise(dur,f0,f1,q,vol,type){
+    if(!this.ctx) return;
+    const t=this.ctx.currentTime;
+    const len=Math.floor(this.ctx.sampleRate*dur);
+    const buf=this.ctx.createBuffer(1,len,this.ctx.sampleRate);
+    const d=buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*(1-i/len);
+    const src=this.ctx.createBufferSource(); src.buffer=buf;
+    const f=this.ctx.createBiquadFilter(); f.type=type||'bandpass'; f.Q.value=q||1;
+    f.frequency.setValueAtTime(f0,t); f.frequency.linearRampToValueAtTime(f1,t+dur);
+    src.connect(f); this._env(f,t,0.01,dur,vol||0.1);
+    src.start(t);
+  }
+  step(){ this.noise(0.06,300,200,0.8,0.08,'lowpass'); }
+  knife(){ this.tone(1200,300,0.15,'sawtooth',0.2); this.noise(0.1,2000,500,1,0.15,'bandpass'); }
+  pickup(){ this.tone(500,800,0.08,'triangle',0.15); }
+  door(){ this.tone(200,80,0.3,'sine',0.25); this.noise(0.2,150,100,1,0.1,'lowpass'); }
+  hit(){ this.tone(100,40,0.2,'square',0.3); }
+  ui(){ this.tone(880,880,0.05,'sine',0.15); }
+}
+
+// ============================================================
+//  ВВОД
+// ============================================================
+class Input {
+  constructor(canvas){
+    this.canvas=canvas;
+    this.touches=new Map();
+    this.joy={active:false,id:null,cx:0,cy:0,x:0,y:0,dx:0,dy:0,radius:70};
+    this.actionBtn={active:false,id:null,x:0,y:0,r:52,pressed:false};
+    this.uiHit=[];
+    this.onUIPress=null;
+    this.keys=new Set();
+    this.bind();
+  }
+  bind(){
+    const c=this.canvas;
+    const opts={passive:false};
+    c.addEventListener('touchstart',e=>this.start(e),opts);
+    c.addEventListener('touchmove',e=>this.move(e),opts);
+    c.addEventListener('touchend',e=>this.end(e),opts);
+    c.addEventListener('touchcancel',e=>this.end(e),opts);
+    c.addEventListener('mousedown',e=>this._mouse(e,'start'));
+    c.addEventListener('mousemove',e=>this._mouse(e,'move'));
+    c.addEventListener('mouseup',e=>this._mouse(e,'end'));
+    window.addEventListener('keydown',e=>this.keys.add(e.key));
+    window.addEventListener('keyup',e=>this.keys.delete(e.key));
+  }
+  _mouse(e,type){
+    const t={identifier:'mouse',clientX:e.clientX,clientY:e.clientY};
+    const fake={touches:[t],changedTouches:[t],preventDefault(){},_fake:true};
+    if(type==='start') this.start(fake);
+    else if(type==='move') this.move(fake);
+    else this.end(fake);
+  }
+  start(e){
+    e.preventDefault();
+    const rect=this.canvas.getBoundingClientRect();
+    for(const t of e.changedTouches){
+      const x=t.clientX-rect.left, y=t.clientY-rect.top;
+      if(this.onUIPress&&this.onUIPress(x,y)){
+        this.touches.set(t.identifier,{x,y,startX:x,startY:y,startT:performance.now(),ui:true});
+        continue;
+      }
+      if(!this.joy.active&&x<rect.width*0.55){
+        this.joy.active=true;
+        this.joy.id=t.identifier;
+        this.joy.cx=x; this.joy.cy=y; this.joy.x=x; this.joy.y=y;
+        this.joy.dx=0; this.joy.dy=0;
+      }
+      this.touches.set(t.identifier,{x,y,startX:x,startY:y,startT:performance.now(),ui:false});
+    }
+  }
+  move(e){
+    e.preventDefault();
+    const rect=this.canvas.getBoundingClientRect();
+    for(const t of e.changedTouches){
+      const rec=this.touches.get(t.identifier);
+      if(!rec) continue;
+      rec.x=t.clientX-rect.left; rec.y=t.clientY-rect.top;
+      if(this.joy.active&&this.joy.id===t.identifier){
+        let dx=rec.x-this.joy.cx, dy=rec.y-this.joy.cy;
+        const len=Math.hypot(dx,dy), R=this.joy.radius;
+        if(len>R){ dx=dx/len*R; dy=dy/len*R; }
+        this.joy.x=this.joy.cx+dx; this.joy.y=this.joy.cy+dy;
+        this.joy.dx=dx/R; this.joy.dy=dy/R;
+      }
+    }
+  }
+  end(e){
+    e.preventDefault();
+    for(const t of e.changedTouches){
+      this.touches.delete(t.identifier);
+      if(this.joy.active&&this.joy.id===t.identifier){
+        this.joy.active=false; this.joy.id=null; this.joy.dx=0; this.joy.dy=0;
+      }
+    }
+  }
+}
+
+// ============================================================
+//  БАЗОВЫЕ СУЩНОСТИ
+// ============================================================
+class Rect {
+  constructor(x,y,w,h){ this.x=x; this.y=y; this.w=w; this.h=h; }
+  intersects(o){ return this.x<o.x+o.w&&this.x+this.w>o.x&&this.y<o.y+o.h&&this.y+this.h>o.y; }
+  contains(px,py){ return px>=this.x&&px<=this.x+this.w&&py>=this.y&&py<=this.y+this.h; }
+  center(){ return {x:this.x+this.w/2,y:this.y+this.h/2}; }
+}
+
+// ============================================================
+//  КАРТА КЛУБА
+// ============================================================
+class ClubMap {
+  constructor(){
+    this.width=1200;
+    this.height=800;
+    this.obstacles=[];
+    this.npcs=[];
+    this.items=[];
+    this.exits=[];
+    this.build();
+  }
+  build(){
+    const W=this.width, H=this.height, t=20;
+    // Внешние стены
+    this.obstacles.push(new Rect(0,0,W,t));
+    this.obstacles.push(new Rect(0,H-t,W,t));
+    this.obstacles.push(new Rect(0,0,t,H));
+    this.obstacles.push(new Rect(W-t,0,t,H));
+    // Барная стойка
+    this.obstacles.push(new Rect(200,200,400,80));
+    // Диваны
+    this.obstacles.push(new Rect(700,300,200,100));
+    this.obstacles.push(new Rect(700,500,200,100));
+    // Лифт
+    this.obstacles.push(new Rect(950,300,120,80));
+    // Сейф (объект, не препятствие)
+    this.safe={x:1000,y:420,w:40,h:40,opened:false,code:'7741'};
+    // Нож (можно взять)
+    this.items.push({id:'knife',x:300,y:400,taken:false});
+    // Флешка (в сейфе)
+    this.usb={x:0,y:0,taken:false,visible:false};
+    // Маркус
+    this.npcs.push({id:'markus',x:600,y:250,w:30,h:40,seduced:false,dead:false});
+    // Охранник
+    this.npcs.push({id:'guard',x:850,y:200,w:30,h:40,dead:false});
+    // Выход (на улицу)
+    this.exits.push({x:W/2-60,y:H-100,w:120,h:80,target:'street'});
+  }
+  collides(r){
+    for(const o of this.obstacles) if(r.intersects(o)) return o;
+    return null;
+  }
+}
+
+// ============================================================
+//  ИГРОК
+// ============================================================
+class Player {
+  constructor(x,y){
+    this.x=x; this.y=y;
+    this.w=24; this.h=32;
+    this.speed=150;
+    this.vx=0; this.vy=0;
+    this.dir='down';
+    this.animT=0;
+    this.stepTimer=0;
+    this.inventory={knife:false,usb:false};
+  }
+  get rect(){ return new Rect(this.x-this.w/2,this.y-this.h/2,this.w,this.h); }
+  update(dt,input,world,game){
+    let dx=0,dy=0;
+    if(input.joy.active){
+      dx=input.joy.dx; dy=input.joy.dy;
+      const len=Math.hypot(dx,dy);
+      if(len>1){ dx/=len; dy/=len; }
+      if(len<0.15){ dx=0; dy=0; }
+    }
+    if(game.keys){
+      if(game.keys.has('w')||game.keys.has('ArrowUp')) dy-=1;
+      if(game.keys.has('s')||game.keys.has('ArrowDown')) dy+=1;
+      if(game.keys.has('a')||game.keys.has('ArrowLeft')) dx-=1;
+      if(game.keys.has('d')||game.keys.has('ArrowRight')) dx+=1;
+    }
+    const mag=Math.hypot(dx,dy);
+    if(mag>1){ dx/=mag; dy/=mag; }
+    this.vx=dx*this.speed; this.vy=dy*this.speed;
+    const nx=this.x+this.vx*dt;
+    if(!world.collides(new Rect(nx-this.w/2,this.y-this.h/2,this.w,this.h))) this.x=nx;
+    const ny=this.y+this.vy*dt;
+    if(!world.collides(new Rect(this.x-this.w/2,ny-this.h/2,this.w,this.h))) this.y=ny;
+    const moving=mag>0.15;
+    if(moving){
+      this.animT+=dt*8;
+      this.stepTimer-=dt;
+      if(this.stepTimer<=0){ game.audio.step(); this.stepTimer=0.35; }
+      if(Math.abs(dx)>Math.abs(dy)) this.dir=dx>0?'right':'left';
+      else this.dir=dy>0?'down':'up';
+    } else this.animT=0;
+  }
+  draw(ctx){
+    ctx.save();
+    ctx.translate(this.x,this.y);
+    // Тень
+    ctx.fillStyle='rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(0,this.h*0.4,this.w*0.6,5,0,0,Math.PI*2);
+    ctx.fill();
+    // Тело — Акимо (белая маска, чёрная кофта)
+    const bob=Math.sin(this.animT)*2;
+    ctx.fillStyle='#1a1a1a';
+    ctx.beginPath();
+    ctx.ellipse(0,bob*0.3,this.w*0.5,this.h*0.5,0,0,Math.PI*2);
+    ctx.fill();
+    // Голова с маской
+    ctx.fillStyle='#f5c6a0';
+    ctx.beginPath();
+    ctx.arc(0,-this.h*0.35+bob*0.3,8,0,Math.PI*2);
+    ctx.fill();
+    // Маска (белая)
+    ctx.fillStyle='#fff';
+    ctx.beginPath();
+    ctx.arc(0,-this.h*0.35+bob*0.3,6,0,Math.PI,true);
+    ctx.fill();
+    ctx.fillStyle='#000';
+    ctx.beginPath();
+    ctx.arc(-2,-this.h*0.35+bob*0.3-1,1.5,0,Math.PI*2);
+    ctx.arc(2,-this.h*0.35+bob*0.3-1,1.5,0,Math.PI*2);
+    ctx.fill();
+    // Нож в руке
+    if(this.inventory.knife){
+      ctx.fillStyle='#888';
+      ctx.fillRect(10,-5,12,3);
+      ctx.fillStyle='#4a2a1a';
+      ctx.fillRect(20,-6,4,5);
+    }
+    ctx.restore();
+  }
+}
+
+// ============================================================
+//  HUD
+// ============================================================
+class HUD {
+  constructor(game){
+    this.game=game;
+    this.toasts=[];
+  }
+  toast(text){ this.toasts.push({text,t:2.0}); if(this.toasts.length>3) this.toasts.shift(); }
+  update(dt){
+    for(let i=this.toasts.length-1;i>=0;i--){
+      this.toasts[i].t-=dt;
+      if(this.toasts[i].t<=0) this.toasts.splice(i,1);
+    }
+  }
+  draw(ctx,W,H,input,game){
+    // Джойстик
+    if(input.joy.active){
+      ctx.save();
+      ctx.globalAlpha=0.35;
+      ctx.strokeStyle='#fff';
+      ctx.lineWidth=3;
+      ctx.beginPath();
+      ctx.arc(input.joy.cx,input.joy.cy,input.joy.radius,0,Math.PI*2);
+      ctx.stroke();
+      ctx.globalAlpha=0.6;
+      ctx.fillStyle='#fff';
+      ctx.beginPath();
+      ctx.arc(input.joy.x,input.joy.y,28,0,Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+    // Кнопка действия
+    const btnX=W-90, btnY=H-130;
+    ctx.save();
+    ctx.globalAlpha=0.8;
+    ctx.fillStyle=game.actionReady?'#22c55e':'#4b5563';
+    ctx.beginPath();
+    ctx.arc(btnX,btnY,50,0,Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha=1;
+    ctx.fillStyle='#fff';
+    ctx.font='bold 14px sans-serif';
+    ctx.textAlign='center';
+    ctx.textBaseline='middle';
+    ctx.fillText(game.actionLabel||'ДЕЙСТВИЕ',btnX,btnY);
+    ctx.restore();
+    // Инвентарь
+    const invY=H-60;
+    const items=[
+      {id:'knife',label:'🔪',has:game.player.inventory.knife},
+      {id:'usb',label:'💾',has:game.player.inventory.usb},
+    ];
+    for(let i=0;i<items.length;i++){
+      const tx=20+i*62;
+      ctx.save();
+      ctx.fillStyle=items[i].has?'#3b82f6':'rgba(30,41,59,0.5)';
+      ctx.beginPath();
+      ctx.roundRect(tx,invY-26,56,52,10);
+      ctx.fill();
+      ctx.strokeStyle=items[i].has?'#93c5fd':'#334155';
+      ctx.lineWidth=2;
+      ctx.stroke();
+      ctx.fillStyle='#fff';
+      ctx.font='26px sans-serif';
+      ctx.textAlign='center';
+      ctx.textBaseline='middle';
+      ctx.fillText(items[i].label,tx+28,invY);
+      ctx.restore();
+    }
+    // Тосты
+    let toastY=100;
+    ctx.save();
+    ctx.font='bold 14px sans-serif';
+    ctx.textAlign='center';
+    ctx.textBaseline='middle';
+    for(const t of this.toasts){
+      const a=clamp(t.t,0,1);
+      ctx.globalAlpha=a;
+      const tw=ctx.measureText(t.text).width+24;
+      ctx.fillStyle='rgba(0,0,0,0.75)';
+      ctx.beginPath();
+      ctx.roundRect(W/2-tw/2,toastY-14,tw,28,14);
+      ctx.fill();
+      ctx.fillStyle='#fff';
+      ctx.fillText(t.text,W/2,toastY);
+      toastY+=34;
+    }
+    ctx.restore();
+    // Подсказка
+    if(game.contextHint){
+      ctx.save();
+      ctx.fillStyle='rgba(0,0,0,0.7)';
+      const tw=ctx.measureText(game.contextHint).width+30;
+      ctx.beginPath();
+      ctx.roundRect(W/2-tw/2,H-200,tw,30,15);
+      ctx.fill();
+      ctx.fillStyle='#fbbf24';
+      ctx.font='bold 13px sans-serif';
+      ctx.textAlign='center';
+      ctx.textBaseline='middle';
+      ctx.fillText(game.contextHint,W/2,H-185);
+      ctx.restore();
+    }
+    // Задача
+    if(game.objective){
+      ctx.save();
+      ctx.fillStyle='rgba(0,0,0,0.7)';
+      ctx.font='bold 12px sans-serif';
+      ctx.textAlign='left';
+      ctx.textBaseline='top';
+      const tw=ctx.measureText('📋 '+game.objective).width+20;
+      ctx.beginPath();
+      ctx.roundRect(20,20,tw,28,10);
+      ctx.fill();
+      ctx.fillStyle='#fbbf24';
+      ctx.fillText('📋 '+game.objective,30,28);
+      ctx.restore();
+    }
+  }
+}
+
+// ============================================================
+//  СИСТЕМА ДИАЛОГОВ
+// ============================================================
+class DialogueSystem {
+  constructor(game){
+    this.game=game;
+    this.active=false;
+    this.lines=[];
+    this.index=0;
+    this.onEnd=null;
+  }
+  start(lines,onEnd){
+    this.lines=lines;
+    this.index=0;
+    this.active=true;
+    this.onEnd=onEnd;
+    this._show();
+  }
+  _show(){
+    if(this.index>=this.lines.length){
+      this.active=false;
+      if(this.onEnd) this.onEnd();
+      return;
+    }
+    const line=this.lines[this.index];
+    this.game.dialogueText=line.text;
+    this.game.dialogueSpeaker=line.speaker;
+    this.game.dialogueVisible=true;
+  }
+  next(){
+    if(!this.active) return;
+    this.index++;
+    this._show();
+  }
+  draw(ctx,W,H){
+    if(!this.active) return;
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.85)';
+    ctx.fillRect(20,H-220,W-40,140);
+    ctx.strokeStyle='#ff6b9d';
+    ctx.lineWidth=2;
+    ctx.strokeRect(20,H-220,W-40,140);
+    // Спикер
+    ctx.fillStyle='#ff6b9d';
+    ctx.font='bold 18px sans-serif';
+    ctx.textAlign='left';
+    ctx.textBaseline='top';
+    ctx.fillText(this.game.dialogueSpeaker||'???',40,H-205);
+    // Текст
+    ctx.fillStyle='#fff';
+    ctx.font='16px sans-serif';
+    const words=(this.game.dialogueText||'').split(' ');
+    let line='',y=H-175;
+    for(const w of words){
+      const test=line?line+' '+w:w;
+      if(ctx.measureText(test).width>W-100){ ctx.fillText(line,40,y); y+=24; line=w; }
+      else line=test;
+    }
+    ctx.fillText(line,40,y);
+    // Подсказка
+    ctx.fillStyle='#666';
+    ctx.font='12px sans-serif';
+    ctx.textAlign='right';
+    ctx.fillText('▶ нажмите для продолжения',W-40,H-95);
+    ctx.restore();
+  }
+}
+
+// ============================================================
+//  ГЛАВНЫЙ КЛАСС
+// ============================================================
+class Game {
+  constructor(canvas){
+    this.canvas=canvas;
+    this.ctx=canvas.getContext('2d');
+    this.input=new Input(canvas);
+    this.audio=new AudioManager();
+    this.world=new ClubMap();
+    this.player=new Player(400,600);
+    this.hud=new HUD(this);
+    this.dialogue=new DialogueSystem(this);
+    this.state='MENU'; // MENU | PLAYING | DIALOGUE | MINIGAME | END
+    this.keys=new Set();
+    this.camera={x:0,y:0};
+    this.actionReady=false;
+    this.actionLabel='ДЕЙСТВИЕ';
+    this.contextHint='';
+    this.objective='Поговорить с Маркусом';
+    this.dialogueText='';
+    this.dialogueSpeaker='';
+    this.dialogueVisible=false;
+    this._lastTime=performance.now();
+    this._acc=0;
+    this._raf=null;
+    this._loop=this._loop.bind(this);
+    this._resize();
+    window.addEventListener('resize',()=>this._resize());
+    window.addEventListener('orientationchange',()=>setTimeout(()=>this._resize(),200));
+    this._bindInput();
+    this._raf=requestAnimationFrame(this._loop);
+  }
+  _resize(){
+    const dpr=Math.min(window.devicePixelRatio||1,3);
+    const w=window.innerWidth, h=window.innerHeight;
+    this.canvas.width=Math.floor(w*dpr);
+    this.canvas.height=Math.floor(h*dpr);
+    this.canvas.style.width=w+'px';
+    this.canvas.style.height=h+'px';
+    this.ctx.setTransform(dpr,0,0,dpr,0,0);
+    this.canvas.clientWidth=w;
+    this.canvas.clientHeight=h;
+  }
+  _bindInput(){
+    this.input.onUIPress=(x,y)=>{
+      const W=this.canvas.clientWidth, H=this.canvas.clientHeight;
+      // Кнопка действия
+      const btnX=W-90, btnY=H-130;
+      if(dist2(x,y,btnX,btnY)<55*55){
+        this._doAction();
+        this.audio.ui();
+        return true;
+      }
+      return false;
+    };
+  }
+  _doAction(){
+    if(this.state!=='PLAYING') return;
+    const p=this.player, px=p.x, py=p.y;
+    // Подобрать нож
+    for(const item of this.world.items){
+      if(item.taken) continue;
+      if(dist2(px,py,item.x,item.y)<50*50){
+        if(item.id==='knife'){ p.inventory.knife=true; item.taken=true; this.hud.toast('🔪 Нож взят'); this.audio.pickup(); return; }
+      }
+    }
+    // Открыть сейф
+    const s=this.world.safe;
+    if(!s.opened && dist2(px,py,s.x+s.w/2,s.y+s.h/2)<60*60){
+      s.opened=true;
+      this.world.usb.visible=true;
+      this.world.usb.x=s.x+s.w/2;
+      this.world.usb.y=s.y+s.h/2;
+      this.hud.toast('🔓 Сейф открыт');
+      this.audio.door();
+      return;
+    }
+    // Взять флешку
+    if(this.world.usb.visible && !this.world.usb.taken && dist2(px,py,this.world.usb.x,this.world.usb.y)<50*50){
+      p.inventory.usb=true;
+      this.world.usb.taken=true;
+      this.hud.toast('💾 Флешка взята');
+      this.objective='Выйти из клуба';
+      this.audio.pickup();
+      return;
+    }
+    // Поговорить с Маркусом
+    const markus=this.world.npcs.find(n=>n.id==='markus');
+    if(markus && !markus.dead && dist2(px,py,markus.x,markus.y)<80*80){
+      if(!markus.seduced){
+        this._startMarkusDialogue();
+        return;
+      } else {
+        this.hud.toast('Маркус уже соблазнён');
+        return;
+      }
+    }
+    // Убить Маркуса
+    if(markus && !markus.dead && p.inventory.knife && dist2(px,py,markus.x,markus.y)<60*60){
+      markus.dead=true;
+      this.hud.toast('Маркус убит');
+      this.audio.hit();
+      this.objective='Выйти из клуба';
+      return;
+    }
+    this.hud.toast('Нечего делать');
+  }
+  _startMarkusDialogue(){
+    const lines=[
+      {speaker:'Акимо',text:'Эй, старикашка, может, развлечёмся в премиум-комнате?'},
+      {speaker:'Маркус',text:'Ого... такая юная, а уже с характером.'},
+      {speaker:'Маркус',text:'Премиум-комната, говоришь? А ты знаешь, сколько это стоит?'},
+      {speaker:'Акимо',text:'Для такой красотки — всё что угодно.'},
+      {speaker:'Маркус',text:'Ха! Мне нравится твой настрой. Пойдём.'},
+    ];
+    this.state='DIALOGUE';
+    this.dialogue.start(lines,()=>{
+      this.state='PLAYING';
+      const markus=this.world.npcs.find(n=>n.id==='markus');
+      if(markus) markus.seduced=true;
+      this.hud.toast('Маркус соблазнён! Ключ у него');
+      this.objective='Забрать ключ или убить Маркуса';
+    });
+  }
+  update(dt){
+    if(this.state==='PLAYING'){
+      this.player.update(dt,this.input,this.world,this);
+      this._updateCamera();
+      this._updateContext();
+      this.hud.update(dt);
+      // Автосохранение
+      if(Math.random()<0.001) this._save();
+    } else if(this.state==='DIALOGUE'){
+      // Ожидание тапа для продолжения
+      if(this.input.touches.size>0){
+        this.dialogue.next();
+        this.input.touches.clear();
+      }
+    }
+  }
+  _updateCamera(){
+    const W=this.canvas.clientWidth, H=this.canvas.clientHeight;
+    const p=this.player;
+    const targetX=clamp(p.x-W/2,0,Math.max(0,this.world.width-W));
+    const targetY=clamp(p.y-H/2,0,Math.max(0,this.world.height-H));
+    this.camera.x=lerp(this.camera.x,targetX,0.15);
+    this.camera.y=lerp(this.camera.y,targetY,0.15);
+  }
+  _updateContext(){
+    const p=this.player, px=p.x, py=p.y;
+    this.actionReady=false;
+    this.actionLabel='ДЕЙСТВИЕ';
+    this.contextHint='';
+    // Подобрать нож
+    for(const item of this.world.items){
+      if(item.taken) continue;
+      if(dist2(px,py,item.x,item.y)<50*50){
+        this.actionReady=true; this.actionLabel='ВЗЯТЬ';
+        this.contextHint='Подобрать нож';
+        return;
+      }
+    }
+    // Сейф
+    const s=this.world.safe;
+    if(!s.opened && dist2(px,py,s.x+s.w/2,s.y+s.h/2)<60*60){
+      this.actionReady=true; this.actionLabel='ОТКРЫТЬ';
+      this.contextHint='Ввести код 7741';
+      return;
+    }
+    // Флешка
+    if(this.world.usb.visible && !this.world.usb.taken && dist2(px,py,this.world.usb.x,this.world.usb.y)<50*50){
+      this.actionReady=true; this.actionLabel='ВЗЯТЬ';
+      this.contextHint='Забрать флешку';
+      return;
+    }
+    // Маркус
+    const markus=this.world.npcs.find(n=>n.id==='markus');
+    if(markus && !markus.dead && !markus.seduced && dist2(px,py,markus.x,markus.y)<80*80){
+      this.actionReady=true; this.actionLabel='ГОВОРИТЬ';
+      this.contextHint='Соблазнить Маркуса';
+      return;
+    }
+    // Убить Маркуса
+    if(markus && !markus.dead && p.inventory.knife && dist2(px,py,markus.x,markus.y)<60*60){
+      this.actionReady=true; this.actionLabel='УБИТЬ';
+      this.contextHint='Убить Маркуса ножом';
+      return;
+    }
+    // Выход
+    for(const e of this.world.exits){
+      const c=e.center();
+      if(dist2(px,py,c.x,c.y)<80*80){
+        this.actionReady=true; this.actionLabel='ВЫЙТИ';
+        this.contextHint='Покинуть клуб';
+        return;
+      }
+    }
+  }
+  draw(){
+    const ctx=this.ctx;
+    const W=this.canvas.clientWidth, H=this.canvas.clientHeight;
+    ctx.fillStyle='#0a0000';
+    ctx.fillRect(0,0,W,H);
+    ctx.save();
+    ctx.translate(-this.camera.x,-this.camera.y);
+    // Пол
+    ctx.fillStyle='#1a0a0a';
+    ctx.fillRect(0,0,this.world.width,this.world.height);
+    // Сетка
+    ctx.strokeStyle='rgba(255,255,255,0.02)';
+    for(let x=0;x<this.world.width;x+=60){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,this.world.height); ctx.stroke(); }
+    for(let y=0;y<this.world.height;y+=60){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(this.world.width,y); ctx.stroke(); }
+    // Препятствия
+    for(const o of this.world.obstacles){
+      ctx.fillStyle='#3a1a1a';
+      ctx.fillRect(o.x,o.y,o.w,o.h);
+      ctx.strokeStyle='#1a0a0a';
+      ctx.lineWidth=2;
+      ctx.strokeRect(o.x+1,o.y+1,o.w-2,o.h-2);
+    }
+    // Сейф
+    const s=this.world.safe;
+    ctx.fillStyle=s.opened?'#4a4a4a':'#2a2a2a';
+    ctx.fillRect(s.x,s.y,s.w,s.h);
+    ctx.strokeStyle='#666';
+    ctx.lineWidth=2;
+    ctx.strokeRect(s.x+1,s.y+1,s.w-2,s.h-2);
+    if(!s.opened){
+      ctx.fillStyle='#ffd24a';
+      ctx.font='bold 10px monospace';
+      ctx.textAlign='center';
+      ctx.fillText('7741',s.x+s.w/2,s.y+s.h/2+3);
+    }
+    // Нож
+    for(const item of this.world.items){
+      if(item.taken) continue;
+      ctx.fillStyle='#888';
+      ctx.fillRect(item.x-8,item.y-2,16,4);
+      ctx.fillStyle='#4a2a1a';
+      ctx.fillRect(item.x+8,item.y-3,5,6);
+    }
+    // Флешка
+    if(this.world.usb.visible && !this.world.usb.taken){
+      ctx.fillStyle='#4a90c8';
+      ctx.fillRect(this.world.usb.x-6,this.world.usb.y-4,12,8);
+      ctx.fillStyle='#fff';
+      ctx.fillRect(this.world.usb.x-3,this.world.usb.y-2,6,4);
+    }
+    // NPC
+    for(const npc of this.world.npcs){
+      if(npc.dead) continue;
+      ctx.save();
+      ctx.translate(npc.x,npc.y);
+      if(npc.id==='markus'){
+        ctx.fillStyle='#4a3a2a';
+        ctx.beginPath();
+        ctx.ellipse(0,0,npc.w*0.5,npc.h*0.5,0,0,Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle='#e8d0b0';
+        ctx.beginPath();
+        ctx.arc(0,-npc.h*0.35,8,0,Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle='#888';
+        ctx.fillRect(-8,-npc.h*0.6,16,4);
+        if(npc.seduced){
+          ctx.fillStyle='#ff6b9d';
+          ctx.font='14px sans-serif';
+          ctx.textAlign='center';
+          ctx.fillText('♥',0,-npc.h*0.8);
+        }
+      } else if(npc.id==='guard'){
+        ctx.fillStyle='#2a2a4a';
+        ctx.beginPath();
+        ctx.ellipse(0,0,npc.w*0.5,npc.h*0.5,0,0,Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle='#e8d0b0';
+        ctx.beginPath();
+        ctx.arc(0,-npc.h*0.35,8,0,Math.PI*2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+    // Игрок
+    this.player.draw(ctx);
+    // Выход
+    for(const e of this.world.exits){
+      ctx.fillStyle='#1e293b';
+      ctx.fillRect(e.x,e.y,e.w,e.h);
+      ctx.strokeStyle='#f59e0b';
+      ctx.lineWidth=3;
+      ctx.strokeRect(e.x,e.y,e.w,e.h);
+      ctx.fillStyle='#f59e0b';
+      ctx.font='bold 14px sans-serif';
+      ctx.textAlign='center';
+      ctx.textBaseline='middle';
+      ctx.fillText('ВЫХОД',e.x+e.w/2,e.y+e.h/2);
+    }
+    ctx.restore();
+    // HUD
+    this.hud.draw(ctx,W,H,this.input,this);
+    // Диалог
+    this.dialogue.draw(ctx,W,H);
+    // Меню
+    if(this.state==='MENU'){
+      ctx.save();
+      ctx.fillStyle='rgba(0,0,0,0.9)';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='#ff6b9d';
+      ctx.font='bold 42px sans-serif';
+      ctx.textAlign='center';
+      ctx.textBaseline='middle';
+      ctx.fillText('АКИМО',W/2,H*0.3);
+      ctx.font='bold 18px sans-serif';
+      ctx.fillStyle='#aaa';
+      ctx.fillText('Пролог: Клуб',W/2,H*0.3+40);
+      const bw=240,bh=70,bx=W/2-bw/2,by=H*0.5;
+      ctx.fillStyle='#22c55e';
+      ctx.beginPath();
+      ctx.roundRect(bx,by,bw,bh,16);
+      ctx.fill();
+      ctx.fillStyle='#fff';
+      ctx.font='bold 22px sans-serif';
+      ctx.fillText('НАЧАТЬ',W/2,by+bh/2);
+      ctx.fillStyle='#666';
+      ctx.font='13px sans-serif';
+      ctx.fillText('Джойстик слева — движение',W/2,H*0.7);
+      ctx.fillText('Кнопка справа — действие',W/2,H*0.7+20);
+      ctx.fillText('Тап по экрану — продолжить диалог',W/2,H*0.7+40);
+      ctx.restore();
+      if(this.input.touches.size>0){
+        for(const [id,t] of this.input.touches){
+          if(t.x>=bx&&t.x<=bx+bw&&t.y>=by&&t.y<=by+bh){
+            this.startGame();
+            this.input.touches.delete(id);
+            break;
+          }
+        }
+      }
+    }
+  }
+  startGame(){
+    this.audio.init();
+    this.audio.resume();
+    this.state='PLAYING';
+    this.objective='Соблазнить Маркуса и забрать флешку';
+    this.hud.toast('Найди Маркуса и соблазни его');
+  }
+  _save(){
+    try {
+      localStorage.setItem('akimo_save',JSON.stringify({
+        x:this.player.x,y:this.player.y,
+        knife:this.player.inventory.knife,
+        usb:this.player.inventory.usb,
+        objective:this.objective,
+        markusSeduced:this.world.npcs.find(n=>n.id==='markus')?.seduced||false,
+        safeOpened:this.world.safe.opened,
+      }));
+    } catch(e){}
+  }
+  _loop(now){
+    this._raf=requestAnimationFrame(this._loop);
+    let dt=(now-this._lastTime)/1000;
+    this._lastTime=now;
+    if(dt>0.1) dt=0.1;
+    this._acc+=dt;
+    const step=1/60;
+    let steps=0;
+    while(this._acc>=step&&steps<5){
+      this.update(step);
+      this._acc-=step;
+      steps++;
+    }
+    this.draw();
+  }
+}
+
+// ============================================================
+//  ЗАПУСК
+// ============================================================
+const canvas=document.getElementById('game');
+if(!CanvasRenderingContext2D.prototype.roundRect){
+  CanvasRenderingContext2D.prototype.roundRect=function(x,y,w,h,r){
+    if(typeof r==='number') r={tl:r,tr:r,br:r,bl:r};
+    this.beginPath();
+    this.moveTo(x+r.tl,y);
+    this.lineTo(x+w-r.tr,y);
+    this.quadraticCurveTo(x+w,y,x+w,y+r.tr);
+    this.lineTo(x+w,y+h-r.br);
+    this.quadraticCurveTo(x+w,y+h,x+w-r.br,y+h);
+    this.lineTo(x+r.bl,y+h);
+    this.quadraticCurveTo(x,y+h,x,y+h-r.bl);
+    this.lineTo(x,y+r.tl);
+    this.quadraticCurveTo(x,y,x+r.tl,y);
+    this.closePath();
+    return this;
+  };
+}
+const game=new Game(canvas);
+window.__game=game;
+</script>
+</body>
+</html>
